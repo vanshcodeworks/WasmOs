@@ -11,73 +11,568 @@
     term.scrollTop = term.scrollHeight;
   }
 
-  // Minimal wasm module embedded: memory + echo(ptr)->ptr
-  const wasmBytes = new Uint8Array([
-    0,97,115,109,1,0,0,0,
-    1,6,1,96,1,127,1,127,
-    3,2,1,0,
-    5,3,1,0,1,
-    7,17,2,6,109,101,109,111,114,121,2,0,4,101,99,104,111,0,0,
-    10,6,1,4,0,32,0,11
-  ]);
+  // WASM module cache
+  const wasmModules = {};
+  const moduleLanguages = {
+    echo: 'C++',
+    fileops: 'C++',
+    math: 'C++',
+    string_utils: 'C++',
+    process: 'C++',
+    sort: 'C++',
+    crypto: 'C',
+    json_parser: 'Go',
+    image_processing: 'TypeScript',
+    network: 'JavaScript'
+  };
 
-  let echoInstancePromise = null;
-  async function getEchoInstance() {
-    if (echoInstancePromise) return echoInstancePromise;
-    echoInstancePromise = (async () => {
-      const { instance } = await WebAssembly.instantiate(wasmBytes, {});
+  // Load a WASM module from build directory
+  async function loadWasmModule(name) {
+    if (wasmModules[name]) return wasmModules[name];
+    
+    try {
+      const response = await fetch(`build/${name}.wasm`);
+      const bytes = await response.arrayBuffer();
+      const { instance } = await WebAssembly.instantiate(bytes, {});
+      wasmModules[name] = instance;
       return instance;
-    })();
-    return echoInstancePromise;
+    } catch (e) {
+      printLine(`Error loading ${name}: ${e.message}`);
+      return null;
+    }
   }
 
-  async function runEcho(args) {
-    const instance = await getEchoInstance();
+  // Helper: write string to WASM memory
+  function writeString(memory, str, offset = 0) {
+    const bytes = enc.encode(str + '\0');
+    const heap = new Uint8Array(memory.buffer);
+    heap.set(bytes, offset);
+    return offset;
+  }
+
+  // Helper: read string from WASM memory
+  function readString(memory, ptr) {
+    const heap = new Uint8Array(memory.buffer);
+    let end = ptr;
+    while (heap[end] !== 0 && end < heap.length) end++;
+    return dec.decode(heap.subarray(ptr, end));
+  }
+
+  // ===== Command Implementations =====
+
+  async function cmdEcho(args) {
+    const instance = await loadWasmModule('echo');
+    if (!instance) return;
+    
     const { memory, echo } = instance.exports;
     const msg = args.join(' ');
-    const msgBytes = enc.encode(msg);
-    const basePtr = 0;
-    const heap = new Uint8Array(memory.buffer);
-    if (msgBytes.length + 1 > heap.length) { printLine('message too long'); return; }
-    heap.set(msgBytes, basePtr);
-    heap[basePtr + msgBytes.length] = 0;
-
-    const resPtr = echo(basePtr) >>> 0;
-    let end = resPtr; while (heap[end] !== 0) end++;
-    const out = dec.decode(heap.subarray(resPtr, end));
+    const ptr = writeString(memory, msg);
+    const resPtr = echo(ptr) >>> 0;
+    const out = readString(memory, resPtr);
     printLine(out);
   }
 
-  // Shell UX features
-  const commands = ['echo','help','clear','date'];
+  async function cmdCat(args) {
+    if (args.length === 0) {
+      printLine('Usage: cat <content...>  or  cat --read');
+      return;
+    }
+    
+    const instance = await loadWasmModule('fileops');
+    if (!instance) return;
+    
+    const { memory, fs_write, fs_read, fs_size } = instance.exports;
+    
+    if (args[0] === '--read') {
+      const size = fs_size();
+      if (size === 0) {
+        printLine('(file is empty)');
+        return;
+      }
+      const heap = new Uint8Array(memory.buffer);
+      const bytesRead = fs_read(1024, 2048);
+      const content = dec.decode(heap.subarray(1024, 1024 + bytesRead));
+      printLine(content);
+    } else {
+      const content = args.join(' ');
+      const ptr = writeString(memory, content);
+      const written = fs_write(ptr, content.length);
+      printLine(`Wrote ${written} bytes to virtual file`);
+    }
+  }
+
+  async function cmdMath(args) {
+    if (args.length === 0) {
+      printLine('Usage: math <operation> <args>');
+      printLine('Operations: add, mul, fact, pow, sqrt, prime');
+      return;
+    }
+    
+    const instance = await loadWasmModule('math');
+    if (!instance) return;
+    
+    const op = args[0];
+    const nums = args.slice(1).map(parseFloat);
+    
+    switch(op) {
+      case 'add':
+        if (nums.length < 2) { printLine('Need 2 numbers'); return; }
+        printLine(`Result: ${instance.exports.math_add(nums[0], nums[1])}`);
+        break;
+      case 'mul':
+        if (nums.length < 2) { printLine('Need 2 numbers'); return; }
+        printLine(`Result: ${instance.exports.math_multiply(nums[0], nums[1])}`);
+        break;
+      case 'fact':
+        if (nums.length < 1) { printLine('Need 1 number'); return; }
+        printLine(`Result: ${instance.exports.math_factorial(Math.floor(nums[0]))}`);
+        break;
+      case 'pow':
+        if (nums.length < 2) { printLine('Need 2 numbers'); return; }
+        printLine(`Result: ${instance.exports.math_power(nums[0], nums[1])}`);
+        break;
+      case 'sqrt':
+        if (nums.length < 1) { printLine('Need 1 number'); return; }
+        printLine(`Result: ${instance.exports.math_sqrt(nums[0])}`);
+        break;
+      case 'prime':
+        if (nums.length < 1) { printLine('Need 1 number'); return; }
+        const isPrime = instance.exports.math_isprime(Math.floor(nums[0]));
+        printLine(`${Math.floor(nums[0])} is ${isPrime ? 'PRIME' : 'NOT PRIME'}`);
+        break;
+      default:
+        printLine(`Unknown operation: ${op}`);
+    }
+  }
+
+  async function cmdStr(args) {
+    if (args.length === 0) {
+      printLine('Usage: str <operation> <text>');
+      printLine('Operations: upper, lower, reverse, wc, len');
+      return;
+    }
+    
+    const instance = await loadWasmModule('string_utils');
+    if (!instance) return;
+    
+    const { memory } = instance.exports;
+    const op = args[0];
+    const text = args.slice(1).join(' ');
+    
+    if (!text && op !== 'len' && op !== 'wc') {
+      printLine('Need text input');
+      return;
+    }
+    
+    const ptr = writeString(memory, text);
+    
+    switch(op) {
+      case 'upper':
+        const upperPtr = instance.exports.str_toupper(ptr);
+        printLine(readString(memory, upperPtr));
+        break;
+      case 'lower':
+        const lowerPtr = instance.exports.str_tolower(ptr);
+        printLine(readString(memory, lowerPtr));
+        break;
+      case 'reverse':
+        const revPtr = instance.exports.str_reverse(ptr);
+        printLine(readString(memory, revPtr));
+        break;
+      case 'wc':
+        const count = instance.exports.str_wordcount(ptr);
+        printLine(`Word count: ${count}`);
+        break;
+      case 'len':
+        const len = instance.exports.str_length(ptr);
+        printLine(`Length: ${len}`);
+        break;
+      default:
+        printLine(`Unknown operation: ${op}`);
+    }
+  }
+
+  async function cmdPs(args) {
+    const instance = await loadWasmModule('process');
+    if (!instance) return;
+    
+    const { memory } = instance.exports;
+    const count = instance.exports.proc_count();
+    
+    printLine('PID  STATUS  NAME');
+    printLine('---  ------  ----');
+    
+    // In a real implementation, we'd query each process
+    // For demo, show system info
+    if (count === 0) {
+      printLine('No processes running');
+    } else {
+      printLine(`${count} process(es) in memory`);
+    }
+    
+    const version = readString(memory, instance.exports.sys_version());
+    const uptime = instance.exports.sys_uptime();
+    const memUsed = instance.exports.sys_memused();
+    
+    printLine(`\nSystem: ${version}`);
+    printLine(`Uptime: ${uptime}s`);
+    printLine(`Memory: ${memUsed} bytes`);
+  }
+
+  async function cmdExec(args) {
+    if (args.length === 0) {
+      printLine('Usage: exec <process_name>');
+      return;
+    }
+    
+    const instance = await loadWasmModule('process');
+    if (!instance) return;
+    
+    const { memory } = instance.exports;
+    const name = args.join(' ');
+    const ptr = writeString(memory, name);
+    const pid = instance.exports.proc_create(ptr);
+    
+    printLine(`Started process '${name}' with PID ${pid}`);
+  }
+
+  // ===== NEW Command Implementations =====
+
+  async function cmdSort(args) {
+    if (args.length === 0) {
+      printLine('Usage: sort <algorithm> <numbers...>');
+      printLine('Algorithms: bubble, quick, bsearch, min, max, avg');
+      printLine('Example: sort quick 64 34 25 12 22 11 90');
+      return;
+    }
+    
+    const instance = await loadWasmModule('sort');
+    if (!instance) return;
+    
+    const { memory } = instance.exports;
+    const op = args[0];
+    const numbers = args.slice(1).map(n => parseInt(n)).filter(n => !isNaN(n));
+    
+    if (numbers.length === 0) {
+      printLine('Please provide numbers to sort');
+      return;
+    }
+    
+    // Write numbers to WASM memory
+    const heap = new Int32Array(memory.buffer);
+    const arrayPtr = 1024; // Start at offset 1024
+    const arrayIndex = arrayPtr / 4;
+    
+    for (let i = 0; i < numbers.length; i++) {
+      heap[arrayIndex + i] = numbers[i];
+    }
+    
+    switch(op) {
+      case 'bubble':
+        instance.exports.bubble_sort(arrayPtr, numbers.length);
+        const bubbleSorted = Array.from(heap.slice(arrayIndex, arrayIndex + numbers.length));
+        printLine(`Bubble Sort: [${bubbleSorted.join(', ')}]`);
+        printLine(`Language: ${moduleLanguages.sort}`);
+        break;
+        
+      case 'quick':
+        instance.exports.quick_sort(arrayPtr, numbers.length);
+        const quickSorted = Array.from(heap.slice(arrayIndex, arrayIndex + numbers.length));
+        printLine(`Quick Sort: [${quickSorted.join(', ')}]`);
+        printLine(`Language: ${moduleLanguages.sort}`);
+        break;
+        
+      case 'bsearch':
+        if (args.length < 3) {
+          printLine('Usage: sort bsearch <target> <sorted_numbers...>');
+          return;
+        }
+        const target = parseInt(args[1]);
+        const searchNums = args.slice(2).map(n => parseInt(n)).filter(n => !isNaN(n));
+        
+        for (let i = 0; i < searchNums.length; i++) {
+          heap[arrayIndex + i] = searchNums[i];
+        }
+        
+        instance.exports.quick_sort(arrayPtr, searchNums.length);
+        const index = instance.exports.binary_search(arrayPtr, searchNums.length, target);
+        
+        if (index !== -1) {
+          printLine(`Found ${target} at index ${index}`);
+        } else {
+          printLine(`${target} not found in array`);
+        }
+        printLine(`Language: ${moduleLanguages.sort}`);
+        break;
+        
+      case 'min':
+        const min = instance.exports.find_min(arrayPtr, numbers.length);
+        printLine(`Minimum: ${min}`);
+        printLine(`Language: ${moduleLanguages.sort}`);
+        break;
+        
+      case 'max':
+        const max = instance.exports.find_max(arrayPtr, numbers.length);
+        printLine(`Maximum: ${max}`);
+        printLine(`Language: ${moduleLanguages.sort}`);
+        break;
+        
+      case 'avg':
+        const avg = instance.exports.calculate_average(arrayPtr, numbers.length);
+        printLine(`Average: ${avg.toFixed(2)}`);
+        printLine(`Language: ${moduleLanguages.sort}`);
+        break;
+        
+      default:
+        printLine(`Unknown operation: ${op}`);
+    }
+  }
+
+  async function cmdCrypto(args) {
+    if (args.length === 0) {
+      printLine('Usage: crypto <operation> <args>');
+      printLine('Operations:');
+      printLine('  caesar <shift> <text>  - Caesar cipher');
+      printLine('  hash <text>            - Simple hash');
+      printLine('  base64 <text>          - Base64 encode');
+      return;
+    }
+    
+    const instance = await loadWasmModule('crypto');
+    if (!instance) return;
+    
+    const { memory } = instance.exports;
+    const op = args[0];
+    
+    switch(op) {
+      case 'caesar':
+        if (args.length < 3) {
+          printLine('Usage: crypto caesar <shift> <text>');
+          return;
+        }
+        const shift = parseInt(args[1]);
+        const text = args.slice(2).join(' ');
+        
+        const inputPtr = writeString(memory, text);
+        const outputPtr = 2048;
+        
+        instance.exports.caesar_encrypt(inputPtr, outputPtr, shift);
+        const encrypted = readString(memory, outputPtr);
+        
+        printLine(`Encrypted: ${encrypted}`);
+        printLine(`Language: ${moduleLanguages.crypto}`);
+        break;
+        
+      case 'hash':
+        if (args.length < 2) {
+          printLine('Usage: crypto hash <text>');
+          return;
+        }
+        const hashText = args.slice(1).join(' ');
+        const hashPtr = writeString(memory, hashText);
+        const hash = instance.exports.simple_hash(hashPtr);
+        
+        printLine(`Hash: ${hash >>> 0}`);
+        printLine(`Language: ${moduleLanguages.crypto}`);
+        break;
+        
+      case 'base64':
+        if (args.length < 2) {
+          printLine('Usage: crypto base64 <text>');
+          return;
+        }
+        const b64Text = args.slice(1).join(' ');
+        const b64InputPtr = writeString(memory, b64Text);
+        const b64OutputPtr = 3072;
+        
+        instance.exports.base64_encode(b64InputPtr, b64OutputPtr, b64Text.length);
+        const encoded = readString(memory, b64OutputPtr);
+        
+        printLine(`Base64: ${encoded}`);
+        printLine(`Language: ${moduleLanguages.crypto}`);
+        break;
+        
+      default:
+        printLine(`Unknown operation: ${op}`);
+    }
+  }
+
+  async function cmdLang(args) {
+    printLine('╔════════════════════════════════════════════════╗');
+    printLine('║  WasmOS - Polyglot Multi-Language System      ║');
+    printLine('╚════════════════════════════════════════════════╝');
+    printLine('');
+    printLine('Supported Languages:');
+    printLine('  ✓ C++            - High performance, systems programming');
+    printLine('  ✓ C              - Low-level operations, cryptography');
+    printLine('  ✓ Go             - Concurrent operations, JSON processing');
+    printLine('  ✓ TypeScript     - Type-safe, image processing');
+    printLine('  ✓ JavaScript     - Network utilities, dynamic operations');
+    printLine('  ○ Python         - Text analysis, AI/ML (coming soon)');
+    printLine('  ○ Rust           - Memory safety, performance (coming soon)');
+    printLine('');
+    printLine('Module Distribution:');
+    Object.entries(moduleLanguages).forEach(([module, lang]) => {
+      printLine(`  ${module.padEnd(20)} → ${lang}`);
+    });
+    printLine('');
+    printLine('Loaded Modules:');
+    const loaded = Object.keys(wasmModules);
+    if (loaded.length === 0) {
+      printLine('  (none loaded yet - modules load on first use)');
+    } else {
+      loaded.forEach(m => {
+        printLine(`  ✓ ${m} (${moduleLanguages[m]})`);
+      });
+    }
+  }
+
+  async function cmdBench(args) {
+    printLine('Running performance benchmarks...');
+    printLine('');
+    
+    // Benchmark: Factorial
+    printLine('Test 1: Factorial(20)');
+    const mathMod = await loadWasmModule('math');
+    if (mathMod) {
+      const start1 = performance.now();
+      const result = mathMod.exports.math_factorial(20);
+      const end1 = performance.now();
+      printLine(`  Result: ${result}`);
+      printLine(`  Time: ${(end1 - start1).toFixed(3)}ms`);
+      printLine(`  Language: C++`);
+    }
+    printLine('');
+    
+    // Benchmark: String operations
+    printLine('Test 2: String Reverse (1000 chars)');
+    const strMod = await loadWasmModule('string_utils');
+    if (strMod) {
+      const { memory } = strMod.exports;
+      const longStr = 'A'.repeat(1000);
+      const ptr = writeString(memory, longStr);
+      
+      const start2 = performance.now();
+      const revPtr = strMod.exports.str_reverse(ptr);
+      const end2 = performance.now();
+      
+      printLine(`  Time: ${(end2 - start2).toFixed(3)}ms`);
+      printLine(`  Language: C++`);
+    }
+    printLine('');
+    
+    // Benchmark: Sorting
+    printLine('Test 3: Quick Sort (1000 numbers)');
+    const sortMod = await loadWasmModule('sort');
+    if (sortMod) {
+      const { memory } = sortMod.exports;
+      const heap = new Int32Array(memory.buffer);
+      const arrayPtr = 1024;
+      const arrayIndex = arrayPtr / 4;
+      const count = 1000;
+      
+      // Generate random numbers
+      for (let i = 0; i < count; i++) {
+        heap[arrayIndex + i] = Math.floor(Math.random() * 10000);
+      }
+      
+      const start3 = performance.now();
+      sortMod.exports.quick_sort(arrayPtr, count);
+      const end3 = performance.now();
+      
+      printLine(`  Time: ${(end3 - start3).toFixed(3)}ms`);
+      printLine(`  Language: C++`);
+    }
+    printLine('');
+    
+    printLine('Benchmark complete!');
+  }
+
+  // ===== Shell Infrastructure =====
+
+  const commands = [
+    'echo', 'help', 'clear', 'date', 'cat', 'math', 'str', 'ps', 'exec', 
+    'modules', 'sort', 'crypto', 'lang', 'bench'
+  ];
   let history = [];
   let histIdx = -1;
   let cwd = '~';
 
   function setPrompt() {
-    promptEl.textContent = `MyWasmOS ${cwd} >`;
+    promptEl.textContent = `WasmOS ${cwd} $`;
   }
 
-  function runCommand(line) {
+  async function runCommand(line) {
     if (!line.trim()) return;
     const parts = line.trim().split(/\s+/);
     const cmd = parts[0];
     const args = parts.slice(1);
+    
     switch(cmd){
       case 'echo':
-        return runEcho(args);
+        await cmdEcho(args);
+        break;
       case 'help':
-        printLine('Commands: echo, help, clear, date');
-        return;
+        printLine('Available Commands:');
+        printLine('  echo <text>          - Echo text using WASM');
+        printLine('  cat <text>           - Write to virtual file');
+        printLine('  cat --read           - Read from virtual file');
+        printLine('  math <op> <nums>     - Math operations (add, mul, fact, pow, sqrt, prime)');
+        printLine('  str <op> <text>      - String operations (upper, lower, reverse, wc, len)');
+        printLine('  sort <op> <nums>     - Sorting & array operations');
+        printLine('  crypto <op> <args>   - Cryptography operations');
+        printLine('  ps                   - Show processes and system info');
+        printLine('  exec <name>          - Create a simulated process');
+        printLine('  modules              - List loaded WASM modules');
+        printLine('  lang                 - Show language support information');
+        printLine('  bench                - Run performance benchmarks');
+        printLine('  date                 - Show current date');
+        printLine('  clear                - Clear screen');
+        printLine('  help                 - Show this help');
+        break;
       case 'clear':
         term.textContent = '';
-        return;
+        break;
       case 'date':
         printLine(new Date().toString());
-        return;
+        break;
+      case 'cat':
+        await cmdCat(args);
+        break;
+      case 'math':
+        await cmdMath(args);
+        break;
+      case 'str':
+        await cmdStr(args);
+        break;
+      case 'ps':
+        await cmdPs(args);
+        break;
+      case 'exec':
+        await cmdExec(args);
+        break;
+      case 'modules':
+        printLine('Loaded WASM modules:');
+        Object.keys(wasmModules).forEach(m => printLine(`  - ${m} (${moduleLanguages[m]})`));
+        if (Object.keys(wasmModules).length === 0) {
+          printLine('  (none loaded yet)');
+        }
+        break;
+      case 'sort':
+        await cmdSort(args);
+        break;
+      case 'crypto':
+        await cmdCrypto(args);
+        break;
+      case 'lang':
+        await cmdLang(args);
+        break;
+      case 'bench':
+        await cmdBench(args);
+        break;
       default:
         printLine(`command not found: ${cmd}`);
-        return;
+        printLine('Type "help" for available commands');
     }
   }
 
@@ -89,24 +584,38 @@
   }
 
   // Initial banner
-  printLine('Welcome to MyWasmOS');
-  printLine('Type "help" to list commands.');
+  printLine('╔════════════════════════════════════════════════╗');
+  printLine('║    WasmOS - Polyglot Mini Operating System    ║');
+  printLine('║  Powered by C++, C, Go, TypeScript, and more  ║');
+  printLine('╚════════════════════════════════════════════════╝');
+  printLine('');
+  printLine('Type "help" for commands or "lang" for language info');
+  printLine('');
   setPrompt();
   input.focus();
 
   // Key handling
-  input.addEventListener('keydown', (e) => {
+  input.addEventListener('keydown', async (e) => {
     if (e.key === 'Enter') {
       const line = input.value;
       printLine(promptEl.textContent + ' ' + line);
-      history.push(line); histIdx = history.length;
+      history.push(line);
+      histIdx = history.length;
       input.value = '';
-      runCommand(line);
+      await runCommand(line);
     } else if (e.key === 'ArrowUp') {
-      if (histIdx > 0) { histIdx--; input.value = history[histIdx] || ''; setTimeout(()=>input.setSelectionRange(input.value.length,input.value.length)); }
+      if (histIdx > 0) {
+        histIdx--;
+        input.value = history[histIdx] || '';
+        setTimeout(() => input.setSelectionRange(input.value.length, input.value.length));
+      }
       e.preventDefault();
     } else if (e.key === 'ArrowDown') {
-      if (histIdx < history.length) { histIdx++; input.value = history[histIdx] || ''; setTimeout(()=>input.setSelectionRange(input.value.length,input.value.length)); }
+      if (histIdx < history.length) {
+        histIdx++;
+        input.value = history[histIdx] || '';
+        setTimeout(() => input.setSelectionRange(input.value.length, input.value.length));
+      }
       e.preventDefault();
     } else if (e.key === 'Tab') {
       const before = input.value;
@@ -116,13 +625,11 @@
       term.textContent = '';
       e.preventDefault();
     } else if (e.ctrlKey && (e.key === 'c' || e.key === 'C')) {
-      // Simulate SIGINT: move to new line, keep prompt
       printLine(promptEl.textContent + ' ' + input.value);
       input.value = '';
       e.preventDefault();
     }
   });
 
-  // Keep focus on input when clicking anywhere
   document.addEventListener('click', () => input.focus());
 })();
