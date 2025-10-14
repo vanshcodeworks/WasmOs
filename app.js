@@ -27,7 +27,8 @@
   };
 
   // Load a WASM module from build directory
-  async function loadWasmModule(name) {
+  async function loadWasmModule(name, options = {}) {
+    const { silent = false } = options;
     if (wasmModules[name]) return wasmModules[name];
     
     try {
@@ -99,7 +100,7 @@
       wasmModules[name] = instance;
       return instance;
     } catch (e) {
-      printLine(`Error loading ${name}: ${e && e.message ? e.message : e}`);
+      if (!silent) printLine(`Error loading ${name}: ${e && e.message ? e.message : e}`);
       return null;
     }
   }
@@ -141,27 +142,41 @@
       printLine('Usage: cat <content...>  or  cat --read');
       return;
     }
-    
-    const instance = await loadWasmModule('fileops');
-    if (!instance) return;
-    
-    const { memory, fs_write, fs_read, fs_size } = instance.exports;
-    
-    if (args[0] === '--read') {
-      const size = fs_size();
-      if (size === 0) {
-        printLine('(file is empty)');
-        return;
+  // Try to use wasm fileops module; if not available, use JS fallback virtual file
+  const instance = await loadWasmModule('fileops', { silent: true });
+    if (instance && instance.exports && instance.exports.fs_write) {
+      const { memory, fs_write, fs_read, fs_size } = instance.exports;
+
+      if (args[0] === '--read') {
+        const size = fs_size();
+        if (size === 0) {
+          printLine('(file is empty)');
+          return;
+        }
+        const heap = new Uint8Array(memory.buffer);
+        const bytesRead = fs_read(1024, 2048);
+        const content = dec.decode(heap.subarray(1024, 1024 + bytesRead));
+        printLine(content);
+      } else {
+        const content = args.join(' ');
+        const ptr = writeString(memory, content);
+        const written = fs_write(ptr, content.length);
+        printLine(`Wrote ${written} bytes to virtual file`);
       }
-      const heap = new Uint8Array(memory.buffer);
-      const bytesRead = fs_read(1024, 2048);
-      const content = dec.decode(heap.subarray(1024, 1024 + bytesRead));
-      printLine(content);
+      return;
+    }
+
+    // JS fallback: simple in-memory virtual file
+    // Store content in a variable; this is ephemeral (not persisted)
+    if (!window.__wasmos_virtual_file) window.__wasmos_virtual_file = '';
+
+    if (args[0] === '--read') {
+      const content = window.__wasmos_virtual_file;
+      if (!content) printLine('(file is empty)'); else printLine(content);
     } else {
       const content = args.join(' ');
-      const ptr = writeString(memory, content);
-      const written = fs_write(ptr, content.length);
-      printLine(`Wrote ${written} bytes to virtual file`);
+      window.__wasmos_virtual_file = content;
+      printLine(`Wrote ${content.length} bytes to virtual file (JS fallback)`);
     }
   }
 
