@@ -1,0 +1,18 @@
+[
+  "crypto.c",
+  "echo.cpp",
+  "echo.wasm",
+  "fileops.cpp",
+  "image_processing.ts",
+  "json_parser.go",
+  "ls.c",
+  "ls.wasm",
+  "main.c",
+  "main.wasm",
+  "math.cpp",
+  "network.js",
+  "process.cpp",
+  "sort.cpp",
+  "string_utils.cpp",
+  "text_analyzer.py"
+]

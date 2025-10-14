@@ -31,19 +31,83 @@
     if (wasmModules[name]) return wasmModules[name];
     
     try {
-      const response = await fetch(`build/${name}.wasm`);
+      // Try build/ first (common build output), then fallback to wasm/ folder next to sources
+      let response = await fetch(`build/${name}.wasm`);
+      if (!response.ok) {
+        response = await fetch(`wasm/${name}.wasm`);
+      }
+
+      if (!response.ok) throw new Error(`Module ${name} not found in build/ or wasm/`);
+
       const bytes = await response.arrayBuffer();
       const { instance } = await WebAssembly.instantiate(bytes, {});
+
+      // If the module doesn't have a memory export or the expected function names,
+      // try to load emscripten JS glue (build/{name}.js) which initializes the
+      // runtime and provides the proper exports.
+      const exports = instance && instance.exports ? Object.keys(instance.exports) : [];
+      const expected = ['memory'];
+      const hasExpected = expected.every(k => exports.includes(k));
+
+      if (!hasExpected) {
+        // Try loading Emscripten JS glue (build/{name}.js) by injecting a script tag.
+        // This handles the common emcc output which maps mangled exports to friendly names.
+        try {
+          const scriptUrl = `build/${name}.js`;
+          const scriptResp = await fetch(scriptUrl);
+          if (scriptResp.ok) {
+            // Prepare a Module object that Emscripten glue will use.
+            // Provide locateFile so the glue finds the wasm in build/.
+            window.Module = window.Module || {};
+            window.Module.locateFile = (file) => `build/${file}`;
+
+            // Inject the script so it runs in the page context.
+            const scriptText = await scriptResp.text();
+            const blob = new Blob([scriptText], { type: 'application/javascript' });
+            const blobUrl = URL.createObjectURL(blob);
+            await new Promise((resolve, reject) => {
+              const s = document.createElement('script');
+              s.src = blobUrl;
+              s.onload = () => { URL.revokeObjectURL(blobUrl); resolve(); };
+              s.onerror = (e) => { URL.revokeObjectURL(blobUrl); reject(new Error('Failed to load emscripten glue')); };
+              document.head.appendChild(s);
+            });
+
+            // Wait for Module to initialize exports. Emscripten sets Module._<symbol> for exported functions.
+            const waitForExports = (timeout = 3000) => new Promise((res, rej) => {
+              const start = Date.now();
+              (function poll() {
+                // If Module has any exported property starting with '_', consider it ready
+                const mod = window.Module || {};
+                const keys = Object.keys(mod);
+                const hasExport = keys.some(k => k.startsWith('_') && typeof mod[k] !== 'undefined');
+                if (hasExport) return res(mod);
+                if (Date.now() - start > timeout) return rej(new Error('Emscripten module did not initialize in time'));
+                setTimeout(poll, 50);
+              })();
+            });
+
+            const resolvedModule = await waitForExports();
+            wasmModules[name] = resolvedModule;
+            return resolvedModule;
+          }
+        } catch (e) {
+          // ignore and fall back to raw instance below
+        }
+      }
+
       wasmModules[name] = instance;
       return instance;
     } catch (e) {
-      printLine(`Error loading ${name}: ${e.message}`);
+      printLine(`Error loading ${name}: ${e && e.message ? e.message : e}`);
       return null;
     }
   }
 
   // Helper: write string to WASM memory
-  function writeString(memory, str, offset = 0) {
+  function writeString(memory, str, offset = 1024) {
+    // Use a safe default scratch area (1024) to avoid writing at address 0 which
+    // some modules may reserve for internal data.
     const bytes = enc.encode(str + '\0');
     const heap = new Uint8Array(memory.buffer);
     heap.set(bytes, offset);
@@ -101,6 +165,33 @@
     }
   }
 
+  async function cmdLs(args) {
+    // Prefer build/manifest.json (built artifacts) and fall back to wasm/manifest.json
+    try {
+      let resp = await fetch('build/manifest.json');
+      if (!resp.ok) resp = await fetch('wasm/manifest.json');
+      if (!resp.ok) {
+        printLine('ls: could not read manifest (tried build/manifest.json and wasm/manifest.json)');
+        return;
+      }
+      const files = await resp.json();
+
+      if (args.length > 0 && args[0] === '-l') {
+        // long listing: show language if known
+        for (const f of files) {
+          const base = f.replace(/\.wasm$/,'');
+          const lang = moduleLanguages[base] || '';
+          printLine(`${(lang || '').padEnd(10)} ${f}`);
+        }
+      } else {
+        // default: print in columns
+        printLine(files.join('  '));
+      }
+    } catch (e) {
+      printLine(`ls: ${e && e.message ? e.message : e}`);
+    }
+  }
+
   async function cmdMath(args) {
     if (args.length === 0) {
       printLine('Usage: math <operation> <args>');
@@ -110,36 +201,66 @@
     
     const instance = await loadWasmModule('math');
     if (!instance) return;
-    
+
+    // Helper to resolve a function from either a raw WebAssembly instance.exports
+    // or an Emscripten Module object which exposes functions as _name
+    function resolveFn(obj, name) {
+      if (!obj) return null;
+      if (obj.exports && typeof obj.exports[name] === 'function') return obj.exports[name];
+      if (typeof obj[name] === 'function') return obj[name];
+      const mname = '_' + name;
+      if (typeof obj[mname] === 'function') return obj[mname];
+      if (obj.Module && typeof obj.Module[mname] === 'function') return obj.Module[mname];
+      return null;
+    }
+
     const op = args[0];
     const nums = args.slice(1).map(parseFloat);
-    
+
     switch(op) {
-      case 'add':
+      case 'add': {
         if (nums.length < 2) { printLine('Need 2 numbers'); return; }
-        printLine(`Result: ${instance.exports.math_add(nums[0], nums[1])}`);
+        const fn = resolveFn(instance, 'math_add');
+        if (!fn) { printLine('math_add not available'); return; }
+        printLine(`Result: ${fn(nums[0], nums[1])}`);
         break;
-      case 'mul':
+      }
+      case 'mul': {
         if (nums.length < 2) { printLine('Need 2 numbers'); return; }
-        printLine(`Result: ${instance.exports.math_multiply(nums[0], nums[1])}`);
+        const fn = resolveFn(instance, 'math_multiply');
+        if (!fn) { printLine('math_multiply not available'); return; }
+        printLine(`Result: ${fn(nums[0], nums[1])}`);
         break;
-      case 'fact':
+      }
+      case 'fact': {
         if (nums.length < 1) { printLine('Need 1 number'); return; }
-        printLine(`Result: ${instance.exports.math_factorial(Math.floor(nums[0]))}`);
+        const fn = resolveFn(instance, 'math_factorial');
+        if (!fn) { printLine('math_factorial not available'); return; }
+        printLine(`Result: ${fn(Math.floor(nums[0]))}`);
         break;
-      case 'pow':
+      }
+      case 'pow': {
         if (nums.length < 2) { printLine('Need 2 numbers'); return; }
-        printLine(`Result: ${instance.exports.math_power(nums[0], nums[1])}`);
+        const fn = resolveFn(instance, 'math_power');
+        if (!fn) { printLine('math_power not available'); return; }
+        printLine(`Result: ${fn(nums[0], nums[1])}`);
         break;
-      case 'sqrt':
+      }
+      case 'sqrt': {
         if (nums.length < 1) { printLine('Need 1 number'); return; }
-        printLine(`Result: ${instance.exports.math_sqrt(nums[0])}`);
+        const fn = resolveFn(instance, 'math_sqrt');
+        if (!fn) { printLine('math_sqrt not available'); return; }
+        printLine(`Result: ${fn(nums[0])}`);
         break;
-      case 'prime':
+      }
+      case 'prime': {
         if (nums.length < 1) { printLine('Need 1 number'); return; }
-        const isPrime = instance.exports.math_isprime(Math.floor(nums[0]));
+        const fn = resolveFn(instance, 'math_isprime');
+        if (!fn) { printLine('math_isprime not available'); return; }
+        const isPrime = fn(Math.floor(nums[0]));
         printLine(`${Math.floor(nums[0])} is ${isPrime ? 'PRIME' : 'NOT PRIME'}`);
         break;
+      }
       default:
         printLine(`Unknown operation: ${op}`);
     }
@@ -538,6 +659,9 @@
         break;
       case 'cat':
         await cmdCat(args);
+        break;
+      case 'ls':
+        await cmdLs(args);
         break;
       case 'math':
         await cmdMath(args);
