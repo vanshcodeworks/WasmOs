@@ -1,13 +1,1 @@
-﻿[
-    "echo.wasm",
-    "fileops.js",
-    "fileops.wasm",
-    "generate-manifest.js",
-    "ls.wasm",
-    "main.js",
-    "main.wasm",
-    "math.js",
-    "math.wasm",
-    "sort.js",
-    "sort.wasm"
-]
+["echo.wasm","fileops.wasm","math.wasm","string_utils.wasm","process.wasm","sort.wasm","crypto.wasm"] 

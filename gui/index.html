@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>WasmOS GUI - WebAssembly Operating System</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="stylesheet" href="css/styles.css">
+    <link rel="stylesheet" href="css/components.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+</head>
+<body>
+    <!-- Boot Screen -->
+    <div id="bootScreen" class="boot-screen">
+        <div class="boot-content">
+            <div class="wasm-logo">
+                <i class="fas fa-microchip"></i>
+            </div>
+            <h1>WasmOS</h1>
+            <p>Pure WebAssembly Operating System</p>
+            <div class="boot-progress">
+                <div class="progress-bar">
+                    <div class="progress-fill" id="bootProgress"></div>
+                </div>
+                <div class="boot-status" id="bootStatus">Initializing WebAssembly modules...</div>
+            </div>
+            <div class="boot-info">
+                <div>Version 1.0.0</div>
+                <div>Multi-language support: C++, C, Go, TypeScript</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Desktop Environment -->
+    <div id="desktop" class="desktop hidden">
+        <!-- Taskbar -->
+        <div class="taskbar">
+            <div class="taskbar-left">
+                <button class="start-button" id="startButton">
+                    <i class="fas fa-th"></i>
+                    <span>WasmOS</span>
+                </button>
+                <div class="taskbar-apps" id="taskbarApps"></div>
+            </div>
+            <div class="taskbar-right">
+                <div class="system-tray">
+                    <div class="tray-item" id="moduleStatus">
+                        <i class="fas fa-cube"></i>
+                        <span>0 modules</span>
+                    </div>
+                    <div class="tray-item" id="systemTime">
+                        <span>--:--</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Start Menu -->
+        <div class="start-menu hidden" id="startMenu">
+            <div class="start-header">
+                <h3>Applications</h3>
+                <button class="close-btn" id="closeStartMenu">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            <div class="start-apps">
+                <div class="app-category">
+                    <h4>System Tools</h4>
+                    <div class="app-grid">
+                        <button class="app-button" data-app="terminal">
+                            <i class="fas fa-terminal"></i>
+                            <span>Terminal</span>
+                        </button>
+                        <button class="app-button" data-app="calculator">
+                            <i class="fas fa-calculator"></i>
+                            <span>Calculator</span>
+                        </button>
+                        <button class="app-button" data-app="about">
+                            <i class="fas fa-info-circle"></i>
+                            <span>About</span>
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Windows Container -->
+        <div class="windows-container" id="windowsContainer"></div>
+
+        <!-- Desktop Icons -->
+        <div class="desktop-icons">
+            <div class="desktop-icon" data-app="terminal">
+                <i class="fas fa-terminal"></i>
+                <span>Terminal</span>
+            </div>
+            <div class="desktop-icon" data-app="calculator">
+                <i class="fas fa-calculator"></i>
+                <span>Calculator</span>
+            </div>
+            <div class="desktop-icon" data-app="about">
+                <i class="fas fa-info-circle"></i>
+                <span>About</span>
+            </div>
+        </div>
+    </div>
+
+    <script src="js/gui.js"></script>
+</body>
+</html>
