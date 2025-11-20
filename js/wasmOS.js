@@ -7,8 +7,10 @@ class WasmOSCore {
         this.dec = new TextDecoder();
         this.memoryManager = new WasmMemoryManager();
         this.commandRegistry = new WasmCommandRegistry(this);
-        
-        // Performance monitoring
+        // simple process table: name => { pid, name, state, loads, lastOp }
+        this.processTable = new Map();
+        this.nextPid = 1;
+
         this.stats = {
             modulesLoaded: 0,
             operationsExecuted: 0,
@@ -129,34 +131,51 @@ class WasmOSCore {
     }
 
     wrapModuleInstance(instance, moduleName) {
+        // create / update pseudo-process entry
+        if (!this.processTable.has(moduleName)) {
+            this.processTable.set(moduleName, {
+                pid: this.nextPid++,
+                name: moduleName,
+                state: 'READY',     // READY, RUNNING, TERMINATED
+                loads: 1,
+                lastOp: null
+            });
+        } else {
+            const p = this.processTable.get(moduleName);
+            p.loads++;
+            p.state = 'READY';
+        }
+
         const wrapped = {
             name: moduleName,
             exports: instance.exports,
             memory: instance.exports.memory,
-            
-            // Add helper methods
-            writeString: (str, offset = 1024) => {
-                return this.memoryManager.writeString(instance.exports.memory, str, offset);
+            writeString: (str, offset) => {
+                return this.memoryManager.writeString(instance.exports.memory, str, offset, moduleName);
             },
-            
             readString: (ptr) => {
                 return this.memoryManager.readString(instance.exports.memory, ptr);
             },
-            
-            // Performance wrapper for function calls
+            writeArray: (array, offset) => {
+                return this.memoryManager.writeArray(instance.exports.memory, array, offset, moduleName);
+            },
             call: (funcName, ...args) => {
+                const proc = this.processTable.get(moduleName);
                 const startTime = performance.now();
                 this.activeOperations.add(`${moduleName}.${funcName}`);
-                
+                if (proc) {
+                    proc.state = 'RUNNING';
+                    proc.lastOp = `${funcName}(${args.join(',')})`;
+                }
                 try {
                     const result = instance.exports[funcName](...args);
                     this.stats.operationsExecuted++;
                     return result;
                 } finally {
                     this.activeOperations.delete(`${moduleName}.${funcName}`);
+                    if (proc) proc.state = 'READY';
                     const duration = performance.now() - startTime;
-                    
-                    if (duration > 10) { // Log slow operations
+                    if (duration > 10) {
                         console.log(`🐌 Slow operation: ${moduleName}.${funcName} took ${duration.toFixed(2)}ms`);
                     }
                 }
@@ -164,6 +183,30 @@ class WasmOSCore {
         };
 
         return wrapped;
+    }
+
+    // expose process info for commands
+    getProcessTable() {
+        const table = [];
+        for (const [name, p] of this.processTable.entries()) {
+            table.push({
+                pid: p.pid,
+                name: p.name,
+                state: p.state,
+                loads: p.loads,
+                lastOp: p.lastOp,
+                memUsage: this.memoryManager.getModuleUsage(name)
+            });
+        }
+        return table.sort((a, b) => a.pid - b.pid);
+    }
+
+    killProcess(name) {
+        const p = this.processTable.get(name);
+        if (!p) return false;
+        this.modules.delete(name);
+        p.state = 'TERMINATED';
+        return true;
     }
 
     updateSystemStatus() {
@@ -182,13 +225,15 @@ class WasmOSCore {
 
     getSystemStats() {
         const uptime = Date.now() - this.stats.startTime;
-        
+        const memPerModule = this.memoryManager.getAllModuleUsage();
+
         return {
             ...this.stats,
-            uptime: uptime,
+            uptime,
             activeOperations: Array.from(this.activeOperations),
             loadedModules: Array.from(this.modules.keys()),
-            memoryUsage: this.memoryManager.getTotalUsage()
+            memoryUsage: this.memoryManager.getTotalUsage(),
+            memoryPerModule: memPerModule
         };
     }
 
@@ -208,51 +253,77 @@ class WasmMemoryManager {
     constructor() {
         this.enc = new TextEncoder();
         this.dec = new TextDecoder();
+        // allocations: Map<moduleName, Map<ptr, size>>
         this.allocations = new Map();
     }
 
-    writeString(memory, str, offset = 1024) {
+    // Ensure per-module map exists
+    ensureModuleEntry(moduleName) {
+        if (!this.allocations.has(moduleName)) {
+            this.allocations.set(moduleName, new Map());
+        }
+        return this.allocations.get(moduleName);
+    }
+
+    writeString(memory, str, offset, moduleName) {
         const bytes = this.enc.encode(str + '\0');
         const heap = new Uint8Array(memory.buffer);
-        
-        if (offset + bytes.length > heap.length) {
-            throw new Error(`String too long: needs ${bytes.length} bytes, available ${heap.length - offset}`);
+        const base = offset ?? 1024;
+        if (base + bytes.length > heap.length) {
+            throw new Error(`String too long: needs ${bytes.length} bytes, available ${heap.length - base}`);
         }
-        
-        heap.set(bytes, offset);
-        this.allocations.set(offset, bytes.length);
-        return offset;
+        heap.set(bytes, base);
+        const modAlloc = this.ensureModuleEntry(moduleName);
+        modAlloc.set(base, bytes.length);
+        return base;
     }
 
     readString(memory, ptr) {
         const heap = new Uint8Array(memory.buffer);
         let end = ptr;
-        
-        while (end < heap.length && heap[end] !== 0) {
-            end++;
-        }
-        
+        while (end < heap.length && heap[end] !== 0) end++;
         if (end >= heap.length) {
             throw new Error('Unterminated string in WASM memory');
         }
-        
         return this.dec.decode(heap.subarray(ptr, end));
     }
 
-    writeArray(memory, array, offset = 2048) {
+    writeArray(memory, array, offset, moduleName) {
         const heap = new Uint8Array(memory.buffer);
-        
-        if (offset + array.length > heap.length) {
+        const base = offset ?? 2048;
+        if (base + array.length > heap.length) {
             throw new Error(`Array too large: needs ${array.length} bytes`);
         }
-        
-        heap.set(array, offset);
-        this.allocations.set(offset, array.length);
-        return offset;
+        heap.set(array, base);
+        const modAlloc = this.ensureModuleEntry(moduleName);
+        modAlloc.set(base, array.length);
+        return base;
     }
 
     getTotalUsage() {
-        return Array.from(this.allocations.values()).reduce((sum, size) => sum + size, 0);
+        let total = 0;
+        for (const modAlloc of this.allocations.values()) {
+            for (const size of modAlloc.values()) total += size;
+        }
+        return total;
+    }
+
+    getModuleUsage(moduleName) {
+        const modAlloc = this.allocations.get(moduleName);
+        if (!modAlloc) return 0;
+        let total = 0;
+        for (const size of modAlloc.values()) total += size;
+        return total;
+    }
+
+    getAllModuleUsage() {
+        const out = {};
+        for (const [name, modAlloc] of this.allocations.entries()) {
+            let total = 0;
+            for (const size of modAlloc.values()) total += size;
+            out[name] = total;
+        }
+        return out;
     }
 }
 
@@ -263,16 +334,18 @@ class WasmCommandRegistry {
     }
 
     async initialize() {
-        // Register all WASM-based commands
+        // Register all WASM-based commands that are actually implemented
         this.registerCommand('echo', new EchoCommand(this.core));
         this.registerCommand('math', new MathCommand(this.core));
         this.registerCommand('str', new StringCommand(this.core));
-        this.registerCommand('file', new FileCommand(this.core));
-        this.registerCommand('proc', new ProcessCommand(this.core));
-        this.registerCommand('crypto', new CryptoCommand(this.core));
-        this.registerCommand('sort', new SortCommand(this.core));
         this.registerCommand('system', new SystemCommand(this.core));
-        
+        this.registerCommand('proc', new ProcessCommand(this.core));
+        // NOTE: file, crypto, sort are commented out to avoid ReferenceError
+        // Add them back only after implementing FileCommand, CryptoCommand, SortCommand
+        // this.registerCommand('file', new FileCommand(this.core));
+        // this.registerCommand('crypto', new CryptoCommand(this.core));
+        // this.registerCommand('sort', new SortCommand(this.core));
+
         console.log(`📝 Registered ${this.commands.size} WASM commands`);
     }
 
@@ -413,16 +486,12 @@ class SystemCommand extends BaseWasmCommand {
         switch (subCmd) {
             case 'stats':
                 return this.formatStats(this.core.getSystemStats());
-                
             case 'modules':
                 return this.formatModules();
-                
             case 'memory':
                 return this.formatMemoryInfo();
-                
             case 'version':
                 return 'WasmOS v2.0.0 - Pure WebAssembly Operating System';
-                
             default:
                 return 'Usage: system <stats|modules|memory|version>';
         }
@@ -452,13 +521,88 @@ class SystemCommand extends BaseWasmCommand {
     }
 
     formatMemoryInfo() {
-        const usage = this.core.memoryManager.getTotalUsage();
-        return [
-            '=== Memory Information ===',
-            `WASM Memory Usage: ${usage} bytes`,
-            `Active Allocations: ${this.core.memoryManager.allocations.size}`,
-            `Browser Memory: ${(performance.memory?.usedJSHeapSize / 1024 / 1024).toFixed(2) || 'N/A'} MB`
-        ].join('\n');
+        const stats = this.core.getSystemStats();
+        const usage = stats.memoryUsage;
+        const perModule = stats.memoryPerModule;
+
+        const lines = [];
+        lines.push('=== Memory Information ===');
+        lines.push(`Total WASM Memory Usage (tracked allocations): ${usage} bytes`);
+        lines.push(`Active Allocations: ${this.core.memoryManager.allocations.size} modules`);
+        lines.push(`Browser JS Heap (approx): ${
+            performance.memory
+                ? (performance.memory.usedJSHeapSize / 1024 / 1024).toFixed(2) + ' MB'
+                : 'N/A'
+        }`);
+        lines.push('');
+        lines.push('Per-module usage (sandboxed linear memories):');
+        if (Object.keys(perModule).length === 0) {
+            lines.push('  (no tracked allocations yet; run echo/str/math first)');
+        } else {
+            Object.entries(perModule).forEach(([name, bytes]) => {
+                lines.push(`  - ${name}.wasm : ${bytes} bytes`);
+            });
+        }
+        return lines.join('\n');
+    }
+}
+
+class ProcessCommand extends BaseWasmCommand {
+    async execute(args) {
+        const sub = args[0] || 'list';
+
+        switch (sub) {
+            case 'list':
+                return this.listProcesses();
+            case 'info':
+                if (!args[1]) throw new Error('Usage: proc info <moduleName>');
+                return this.showInfo(args[1]);
+            case 'kill':
+                if (!args[1]) throw new Error('Usage: proc kill <moduleName>');
+                return this.kill(args[1]);
+            default:
+                return 'Usage: proc <list|info|kill>';
+        }
+    }
+
+    listProcesses() {
+        const table = this.core.getProcessTable();
+        if (table.length === 0) return 'No WASM processes (modules) loaded';
+
+        const lines = [];
+        lines.push('PID   STATE      MEM(bytes)   NAME');
+        lines.push('----  ---------  ----------   ----------------');
+        for (const p of table) {
+            lines.push(
+                `${String(p.pid).padEnd(4)}  ` +
+                `${(p.state || '').padEnd(9)}  ` +
+                `${String(p.memUsage).padEnd(10)}   ` +
+                `${p.name}`
+            );
+        }
+        return lines.join('\n');
+    }
+
+    showInfo(name) {
+        const table = this.core.getProcessTable();
+        const p = table.find(x => x.name === name);
+        if (!p) return `Process/module '${name}' not found`;
+
+        const lines = [];
+        lines.push(`Process: ${p.name}`);
+        lines.push(`PID: ${p.pid}`);
+        lines.push(`State: ${p.state}`);
+        lines.push(`Memory: ${p.memUsage} bytes`);
+        lines.push(`Loads: ${p.loads}`);
+        lines.push(`Last Op: ${p.lastOp || '(none)'}`);
+        return lines.join('\n');
+    }
+
+    kill(name) {
+        const ok = this.core.killProcess(name);
+        return ok
+            ? `Process/module '${name}' terminated (unloaded from cache)`
+            : `Process/module '${name}' not found or already terminated`;
     }
 }
 

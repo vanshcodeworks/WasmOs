@@ -15,20 +15,6 @@ A lightweight, browser-based operating system that demonstrates how code written
 
 ## Architecture
 
-```
-┌─────────────┐
-│  Browser    │
-│  (HTML/JS)  │
-└──────┬──────┘
-       │
-       ├─> WASM Module Loader
-       │
-       ├─> echo.wasm (C++)
-       ├─> fileops.wasm (C++)
-       ├─> math.wasm (C++)
-       ├─> string_utils.wasm (C++)
-       └─> process.wasm (C++)
-```
 
 ## Prerequisites
 
@@ -139,40 +125,122 @@ WasmOs/
     └── process.wasm
 ```
 
-## Adding New Modules
+## Sandboxing Model
 
-1. **Write your module** in C++ (or Rust, Go, etc.):
-   ```cpp
-   // wasm/mymodule.cpp
-   extern "C" {
-     int my_function(int x) {
-       return x * 2;
-     }
-   }
-   ```
+WasmOS relies on WebAssembly’s built‑in sandbox:
 
-2. **Add to build script**:
-   ```bash
-   emcc wasm/mymodule.cpp -O3 \
-     -s WASM=1 \
-     -s EXPORTED_FUNCTIONS='["_my_function"]' \
-     -o build/mymodule.wasm
-   ```
+- Each `.wasm` file is a **separate module** with its own linear memory.
+- Modules cannot:
+  - Access host OS resources directly (files, network, devices)
+  - Access JS variables or other modules’ memory
+- The only way to talk to a module is through its **exported functions**.
+- The host (`wasmOS.js`) decides:
+  - Which imports are given to the module
+  - Which exports are callable from the shell
 
-3. **Use in app.js**:
-   ```javascript
-   async function cmdMyCommand(args) {
-     const instance = await loadWasmModule('mymodule');
-     const result = instance.exports.my_function(42);
-     printLine(`Result: ${result}`);
-   }
-   ```
+**Data flow (safe boundary):**
+
+1. JS encodes a string → writes into the module’s memory (`writeString`)
+2. JS calls a WASM function with a memory pointer and length
+3. WASM reads from its own memory, computes, writes result back into its own buffer
+4. WASM returns a pointer
+5. JS reads bytes from that pointer and decodes back to a JS string
+
+This pattern makes it easy to reason about isolation and to log all cross‑boundary calls.
+
+## Loading New Modules (Any Language → WASM → WasmOS)
+
+Any language that can compile to WebAssembly can become a **first‑class “process”** inside WasmOS.
+
+### Step 1 – Write code in your language
+
+Example in C++:
+
+```cpp
+// filepath: wasm/mymodule.cpp
+extern "C" {
+  // Pure computation: no OS calls, no global state
+  int my_function(int x) {
+    return x * 2;
+  }
+}
+```
+
+For Go, Rust, AssemblyScript, etc. you write the same logic in that language and compile to a standalone WASM module.
+
+### Step 2 – Compile to `.wasm`
+
+Using Emscripten (C/C++):
+
+```bash
+emcc wasm/mymodule.cpp -O3 \
+  -s WASM=1 \
+  -s STANDALONE_WASM=1 \
+  --no-entry \
+  -s EXPORTED_FUNCTIONS='["_my_function"]' \
+  -o build/mymodule.wasm
+```
+
+For Go (TinyGo):
+
+```bash
+tinygo build -o build/mymodule.wasm -target wasm wasm/mymodule.go
+```
+
+For AssemblyScript:
+
+```bash
+asc wasm/mymodule.ts -O3 --exportRuntime -o build/mymodule.wasm
+```
+
+### Step 3 – Expose it as a WasmOS command
+
+Inside the JS host (terminal layer), you load the module and call its exports:
+
+```javascript
+// filepath: e:\WasmOs\app.js
+// ...existing code...
+async function cmdMyModule(args) {
+  const instance = await loadWasmModule('mymodule');
+  if (!instance) return;
+
+  const result = instance.exports.my_function(42);
+  printLine(`Result: ${result}`);
+}
+// Then register 'mymodule' as a command in runCommand()
+// ...existing code...
+```
+
+Now from the WasmOS terminal:
+
+```bash
+WasmOS $ mymodule
+Result: 84
+```
+
+### Step 4 – Security / Sandboxing for New Modules
+
+When you add a module like `mymodule.wasm`:
+
+- It runs inside the **same WASM sandbox** as all other modules
+- It only uses:
+  - Its own memory
+  - Functions you explicitly imported (`env.*`)
+- It cannot:
+  - Read/write host files
+  - Access the network
+  - Touch other modules’ memory
+
+If you want to sandbox higher‑level languages (Python, Ruby, etc.), you compile their runtimes to WASM (e.g. Pyodide) and then:
+
+1. Load `python_runtime.wasm` as a module
+2. Expose a small API like: `_py_eval(codePointer, len, outPtr, maxLen)`
+3. From the terminal, write Python code into its memory, call `_py_eval`, and read back the result
+
+This keeps user code **fully contained** inside the WASM runtime.
 
 ## Future Enhancements
 
-- [ ] Rust module examples
-- [ ] Go module examples
-- [ ] Python (Pyodide) integration
 - [ ] Persistent file system (IndexedDB)
 - [ ] Multi-threading with Web Workers
 - [ ] Graphics UI layer
